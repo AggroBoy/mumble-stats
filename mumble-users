@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+"""Query a Mumble/Murmur server for its current online user count."""
+
+from __future__ import annotations
+
+import argparse
+import ipaddress
+import os
+import socket
+import struct
+import sys
+import time
+from collections.abc import Mapping
+from dataclasses import dataclass
+
+
+DEFAULT_PORT = 64738
+DEFAULT_TIMEOUT = 2.0
+PING_REQUEST = struct.Struct(">IQ")
+PING_RESPONSE = struct.Struct(">IQIII")
+
+
+class MumbleQueryError(Exception):
+    """Raised when the server cannot be queried successfully."""
+
+
+@dataclass(frozen=True)
+class ServerStats:
+    version: int
+    users: int
+    max_users: int
+    max_bandwidth: int
+
+
+def parse_host_port(value: str, default_port: int) -> tuple[str, int]:
+    """Parse HOST, HOST:PORT, IPv6, or [IPv6]:PORT."""
+    if not value:
+        raise ValueError("server must not be empty")
+
+    if value.startswith("["):
+        end = value.find("]")
+        if end == -1:
+            raise ValueError("missing closing ']' in bracketed IPv6 address")
+        host = value[1:end]
+        rest = value[end + 1 :]
+        if not rest:
+            return host, default_port
+        if not rest.startswith(":"):
+            raise ValueError("unexpected text after bracketed host")
+        return host, parse_port(rest[1:])
+
+    if value.count(":") == 1:
+        host, port_text = value.rsplit(":", 1)
+        if not host:
+            raise ValueError("host must not be empty")
+        return host, parse_port(port_text)
+
+    # Treat unbracketed IPv6 literals as host-only values. This also leaves
+    # hostnames containing no colon on the default port.
+    if ":" in value:
+        try:
+            ipaddress.IPv6Address(value)
+        except ValueError as exc:
+            raise ValueError("IPv6 addresses with ports must use [addr]:port") from exc
+    return value, default_port
+
+
+def parse_port(value: str) -> int:
+    try:
+        port = int(value, 10)
+    except ValueError as exc:
+        raise ValueError(f"invalid port: {value!r}") from exc
+
+    if not 1 <= port <= 65535:
+        raise ValueError("port must be in range 1-65535")
+    return port
+
+
+def format_server(host: str, port: int) -> str:
+    if ":" in host and not host.startswith("["):
+        return f"[{host}]:{port}"
+    return f"{host}:{port}"
+
+
+def format_version(version: int) -> str:
+    major = (version >> 16) & 0xFFFF
+    minor = (version >> 8) & 0xFF
+    patch = version & 0xFF
+    return f"{major}.{minor}.{patch}"
+
+
+def format_user_count(users: int) -> str:
+    noun = "user" if users == 1 else "users"
+    return f"{users} {noun}"
+
+
+def resolve_target(
+    server: str | None,
+    port: int | None,
+    environ: Mapping[str, str] = os.environ,
+) -> tuple[str, int]:
+    server = server or environ.get("MUMBLE_SERVER")
+    if not server:
+        raise ValueError("server must be provided as an argument or MUMBLE_SERVER")
+
+    if port is None:
+        env_port = environ.get("MUMBLE_SERVER_PORT")
+        port = parse_port(env_port) if env_port else DEFAULT_PORT
+
+    return parse_host_port(server, port)
+
+
+def build_ping_request(nonce: int) -> bytes:
+    return PING_REQUEST.pack(0, nonce & 0xFFFFFFFFFFFFFFFF)
+
+
+def parse_ping_response(data: bytes, expected_nonce: int | None = None) -> ServerStats:
+    if len(data) < PING_RESPONSE.size:
+        raise MumbleQueryError(
+            f"malformed response: expected at least {PING_RESPONSE.size} bytes, got {len(data)}"
+        )
+
+    version, nonce, users, max_users, max_bandwidth = PING_RESPONSE.unpack(
+        data[: PING_RESPONSE.size]
+    )
+    if expected_nonce is not None and nonce != (expected_nonce & 0xFFFFFFFFFFFFFFFF):
+        raise MumbleQueryError("malformed response: nonce did not match request")
+
+    return ServerStats(
+        version=version,
+        users=users,
+        max_users=max_users,
+        max_bandwidth=max_bandwidth,
+    )
+
+
+def query_server(host: str, port: int, timeout: float) -> ServerStats:
+    nonce = time.time_ns() & 0xFFFFFFFFFFFFFFFF
+    request = build_ping_request(nonce)
+
+    try:
+        addrinfos = socket.getaddrinfo(host, port, type=socket.SOCK_DGRAM)
+    except OSError as exc:
+        raise MumbleQueryError(f"could not resolve {host!r}: {exc}") from exc
+
+    errors: list[str] = []
+    for family, socktype, proto, _canonname, sockaddr in addrinfos:
+        try:
+            with socket.socket(family, socktype, proto) as sock:
+                sock.settimeout(timeout)
+                sock.sendto(request, sockaddr)
+                data, _addr = sock.recvfrom(1024)
+                return parse_ping_response(data, nonce)
+        except socket.timeout:
+            errors.append(f"{sockaddr}: timed out")
+        except OSError as exc:
+            errors.append(f"{sockaddr}: {exc}")
+        except MumbleQueryError as exc:
+            errors.append(f"{sockaddr}: {exc}")
+
+    detail = "; ".join(errors) if errors else "no address records"
+    raise MumbleQueryError(f"no valid response from {host}:{port} ({detail})")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Print the current online user count for a Mumble/Murmur server.",
+        epilog=(
+            "SERVER may be omitted when MUMBLE_SERVER is set. "
+            "MUMBLE_SERVER may include a port, or MUMBLE_SERVER_PORT may provide one."
+        ),
+    )
+    parser.add_argument(
+        "server",
+        nargs="?",
+        help="server host, host:port, or [IPv6]:port (or set MUMBLE_SERVER)",
+    )
+    parser.add_argument(
+        "-p",
+        "--port",
+        type=parse_port,
+        default=None,
+        help=(
+            "UDP port to query when not included in SERVER "
+            f"(default: MUMBLE_SERVER_PORT or {DEFAULT_PORT})"
+        ),
+    )
+    parser.add_argument(
+        "-t",
+        "--timeout",
+        type=float,
+        default=DEFAULT_TIMEOUT,
+        help=f"socket timeout in seconds (default: {DEFAULT_TIMEOUT:g})",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="print server version and capacity in a human-readable format",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.timeout <= 0:
+        parser.error("--timeout must be greater than zero")
+
+    try:
+        host, port = resolve_target(args.server, args.port)
+        stats = query_server(host, port, args.timeout)
+    except ValueError as exc:
+        parser.error(str(exc))
+    except MumbleQueryError as exc:
+        print(f"mumble-users: {exc}", file=sys.stderr)
+        return 1
+
+    if args.verbose:
+        print(
+            f"{format_server(host, port)} (version: {format_version(stats.version)}): "
+            f"{format_user_count(stats.users)} online (maximum: {stats.max_users})"
+        )
+    else:
+        print(stats.users)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
